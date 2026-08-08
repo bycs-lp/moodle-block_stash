@@ -36,6 +36,8 @@ use block_stash\swap;
 use block_stash\user_item;
 use core_privacy\local\metadata\collection;
 use core_privacy\local\request\approved_contextlist;
+use core_privacy\local\request\approved_userlist;
+use core_privacy\local\request\userlist;
 use core_privacy\local\request\transform;
 use core_privacy\local\request\writer;
 
@@ -49,6 +51,7 @@ use core_privacy\local\request\writer;
  */
 class provider implements
     \core_privacy\local\metadata\provider,
+    \core_privacy\local\request\core_userlist_provider,
     \core_privacy\local\request\plugin\provider {
 
     use \core_privacy\local\legacy_polyfill;
@@ -375,6 +378,104 @@ class provider implements
 
         $swapids = $DB->get_records_sql($sql, $params);
         $DB->delete_records_list('block_stash_swap', 'id', array_keys($swapids));
+    }
+
+    /**
+     * Get the list of users who have data within a context.
+     *
+     * @param userlist $userlist The userlist containing the list of users who have data in this context.
+     */
+    public static function get_users_in_context(userlist $userlist) {
+        $context = $userlist->get_context();
+        if ($context->contextlevel != CONTEXT_COURSE) {
+            return;
+        }
+
+        $sql = "SELECT ui.userid
+                  FROM {" . user_item::TABLE . "} ui
+                  JOIN {" . item::TABLE . "} i ON i.id = ui.itemid
+                  JOIN {" . stash::TABLE . "} s ON s.id = i.stashid
+                 WHERE s.courseid = :courseid1
+                UNION
+                SELECT dp.userid
+                  FROM {" . drop_pickup::TABLE . "} dp
+                  JOIN {" . drop::TABLE . "} d ON d.id = dp.dropid
+                  JOIN {" . item::TABLE . "} i ON i.id = d.itemid
+                  JOIN {" . stash::TABLE . "} s ON s.id = i.stashid
+                 WHERE s.courseid = :courseid2
+                UNION
+                SELECT ss.initiator AS userid
+                  FROM {block_stash_swap} ss
+                  JOIN {" . stash::TABLE . "} s ON s.id = ss.stashid
+                 WHERE s.courseid = :courseid3
+                UNION
+                SELECT ss.receiver AS userid
+                  FROM {block_stash_swap} ss
+                  JOIN {" . stash::TABLE . "} s ON s.id = ss.stashid
+                 WHERE s.courseid = :courseid4";
+        $userlist->add_from_sql('userid', $sql, [
+            'courseid1' => $context->instanceid,
+            'courseid2' => $context->instanceid,
+            'courseid3' => $context->instanceid,
+            'courseid4' => $context->instanceid,
+        ]);
+    }
+
+    /**
+     * Delete multiple users within a single context.
+     *
+     * @param approved_userlist $userlist The approved context and user information to delete information for.
+     */
+    public static function delete_data_for_users(approved_userlist $userlist) {
+        global $DB;
+
+        $context = $userlist->get_context();
+        if ($context->contextlevel != CONTEXT_COURSE) {
+            return;
+        }
+
+        $userids = $userlist->get_userids();
+        if (empty($userids)) {
+            return;
+        }
+
+        list($userinsql, $userparams) = $DB->get_in_or_equal($userids, SQL_PARAMS_NAMED, 'userid');
+
+        $itemids = static::get_itemids_from_courseids([$context->instanceid]);
+        if (!empty($itemids)) {
+            list($iteminsql, $itemparams) = $DB->get_in_or_equal($itemids, SQL_PARAMS_NAMED, 'itemid');
+            $params = array_merge($userparams, $itemparams);
+            $DB->delete_records_select(user_item::TABLE, "userid $userinsql AND itemid $iteminsql", $params);
+
+            $dropids = static::get_dropids_from_itemids($itemids);
+            if (!empty($dropids)) {
+                list($dropinsql, $dropparams) = $DB->get_in_or_equal($dropids, SQL_PARAMS_NAMED, 'dropid');
+                $params = array_merge($userparams, $dropparams);
+                $DB->delete_records_select(drop_pickup::TABLE, "userid $userinsql AND dropid $dropinsql", $params);
+            }
+        }
+
+        $swapsql = "SELECT sd.id
+                      FROM {block_stash_swap_detail} sd
+                      JOIN {block_stash_swap} ss ON ss.id = sd.swapid
+                      JOIN {" . stash::TABLE . "} s ON s.id = ss.stashid
+                     WHERE s.courseid = :courseid
+                       AND (ss.initiator $userinsql OR ss.receiver $userinsql)";
+        $params = array_merge(['courseid' => $context->instanceid], $userparams);
+        $swapdetailids = $DB->get_records_sql($swapsql, $params);
+        if (!empty($swapdetailids)) {
+            $DB->delete_records_list('block_stash_swap_detail', 'id', array_keys($swapdetailids));
+        }
+
+        $swapsql = "SELECT ss.id
+                      FROM {block_stash_swap} ss
+                      JOIN {" . stash::TABLE . "} s ON s.id = ss.stashid
+                     WHERE s.courseid = :courseid
+                       AND (ss.initiator $userinsql OR ss.receiver $userinsql)";
+        $swapids = $DB->get_records_sql($swapsql, $params);
+        if (!empty($swapids)) {
+            $DB->delete_records_list('block_stash_swap', 'id', array_keys($swapids));
+        }
     }
 
     /**
